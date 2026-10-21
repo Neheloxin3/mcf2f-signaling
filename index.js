@@ -1,138 +1,128 @@
-const MAX_ROOM_LENGTH = 64;
-const MAX_SDP_LENGTH = 200_000;
-
+/**
+ * Cloudflare Worker entry point for Friend-to-Friend WebRTC signaling.
+ * Room traffic is routed through a Durable Object so both players share one
+ * room even when Cloudflare serves their WebSocket connections on different
+ * Worker instances.
+ *
+ * Requires the existing Durable Object binding: env.RELAY (class Relay).
+ */
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") {
-      return Response.json({ status: "ok", service: "mcf2f-signaling-server" });
+
+    if (url.pathname === "/health" && request.method === "GET") {
+      return Response.json({ ok: true, service: "mcf2f-srelay" });
     }
 
-    if (url.pathname !== "/" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("Not found", { status: 404 });
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 400 });
     }
 
-    const id = env.RELAY.idFromName("mcf2f-global-relay");
+    const room = (url.searchParams.get("room") ?? "").trim().toUpperCase();
+    if (!/^[A-Z0-9]{6,12}$/.test(room)) {
+      return new Response("A valid room code is required in ?room=CODE", { status: 400 });
+    }
+
+    const id = env.RELAY.idFromName(room);
     return env.RELAY.get(id).fetch(request);
   },
 };
 
+/** One Durable Object instance handles every signaling socket for one room. */
 export class Relay {
-  constructor(ctx, env) {
-    this.ctx = ctx;
-    this.env = env;
+  constructor(state) {
+    this.state = state;
   }
 
   async fetch(request) {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("WebSocket upgrade required", { status: 426 });
+      return new Response("Expected WebSocket upgrade", { status: 400 });
     }
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ peerId: crypto.randomUUID(), room: null });
+    const url = new URL(request.url);
+
+    server.serializeAttachment({ role: url.searchParams.get("role") ?? "guest" });
+    this.state.acceptWebSocket(server);
+
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws, rawMessage) {
-    if (typeof rawMessage !== "string") {
-      ws.close(1003, "Text JSON messages required");
-      return;
-    }
-
+  async webSocketMessage(sender, rawMessage) {
     let message;
     try {
-      message = JSON.parse(rawMessage);
+      message = JSON.parse(
+        typeof rawMessage === "string"
+          ? rawMessage
+          : new TextDecoder().decode(rawMessage)
+      );
     } catch {
-      ws.close(1007, "Invalid JSON");
+      sender.send(JSON.stringify({ type: "error", message: "Invalid signaling message" }));
       return;
     }
-    if (!message || typeof message !== "object" || Array.isArray(message)) return;
 
-    const attachment = ws.deserializeAttachment() || { peerId: crypto.randomUUID(), room: null };
-    const type = message.type;
+    if (!["join", "offer", "answer", "candidate"].includes(message.type)) {
+      sender.send(JSON.stringify({ type: "error", message: "Unknown signaling message type" }));
+      return;
+    }
 
-    if (type === "join") {
-      const roomName = message.room;
-      if (typeof roomName !== "string" || roomName.length < 1 || roomName.length > MAX_ROOM_LENGTH || !/^[A-Za-z0-9_-]+$/.test(roomName)) {
-        ws.close(1008, "Invalid room code");
-        return;
+    if (message.type === "join") {
+      const cachedOffer = await this.state.storage.get("lastOffer");
+      if (cachedOffer && Date.now() - cachedOffer.createdAt < 5 * 60 * 1000) {
+        sender.send(cachedOffer.payload);
       }
 
-      if (attachment.room && attachment.room !== roomName) {
-        await this.removeOfferOwnerIfNeeded(attachment.room, attachment.peerId);
-      }
+      const cachedCandidates =
+        (await this.state.storage.get("hostCandidates")) ?? [];
 
-      const peers = this.peersInRoom(roomName);
-      if (!peers.some((peer) => peer === ws) && peers.length >= 2) {
-        ws.close(1013, "Room is full");
-        return;
-      }
-
-      attachment.room = roomName;
-      ws.serializeAttachment(attachment);
-      ws.send(JSON.stringify({ type: "room", room: roomName }));
-
-      const savedOffer = await this.ctx.storage.get(`offer:${roomName}`);
-      if (savedOffer && savedOffer.ownerId !== attachment.peerId) {
-        ws.send(JSON.stringify(savedOffer.message));
+      for (const candidate of cachedCandidates) {
+        if (Date.now() - candidate.createdAt < 5 * 60 * 1000) {
+          sender.send(candidate.payload);
+        }
       }
       return;
     }
 
-    if (type !== "offer" && type !== "answer") return;
-    const roomName = attachment.room;
-    if (!roomName || (message.room != null && message.room !== roomName)) return;
-    if (typeof message.sdp !== "string" || message.sdp.length > MAX_SDP_LENGTH) return;
+    const payload = JSON.stringify(message);
 
-    const outgoing = { type, room: roomName, sdp: message.sdp };
-    const peers = this.peersInRoom(roomName);
-
-    if (type === "offer") {
-      await this.ctx.storage.put(`offer:${roomName}`, { ownerId: attachment.peerId, message: outgoing });
-      for (const peer of peers) {
-        if (peer !== ws && peer.readyState === WebSocket.OPEN) peer.send(JSON.stringify(outgoing));
-      }
-      return;
-    }
-
-    const savedOffer = await this.ctx.storage.get(`offer:${roomName}`);
-    if (savedOffer && savedOffer.ownerId !== attachment.peerId) {
-      const owner = peers.find((peer) => {
-        const peerAttachment = peer.deserializeAttachment();
-        return peerAttachment?.peerId === savedOffer.ownerId;
+    if (message.type === "offer") {
+      await this.state.storage.put("lastOffer", {
+        payload,
+        createdAt: Date.now(),
       });
-      if (owner && owner.readyState === WebSocket.OPEN) owner.send(JSON.stringify(outgoing));
+    }
+
+    if (
+      message.type === "candidate" &&
+      sender.deserializeAttachment()?.role === "host"
+    ) {
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      const candidates =
+        (await this.state.storage.get("hostCandidates") ?? [])
+          .filter((candidate) => candidate.createdAt >= cutoff);
+
+      candidates.push({ payload, createdAt: Date.now() });
+      await this.state.storage.put("hostCandidates", candidates);
+    }
+
+    for (const socket of this.state.getWebSockets()) {
+      if (socket === sender) continue;
+
+      try {
+        socket.send(payload);
+      } catch {
+        // A closed peer will be removed by Cloudflare's WebSocket lifecycle.
+      }
     }
   }
 
-  async webSocketClose(ws) {
-    await this.handleClose(ws);
+  async webSocketClose(_socket, code, reason) {
+    console.log(`Signaling socket closed (${code}): ${reason}`);
   }
 
-  async webSocketError(ws) {
-    await this.handleClose(ws);
-  }
-
-  async handleClose(ws) {
-    const attachment = ws.deserializeAttachment();
-    if (attachment?.room && attachment?.peerId) {
-      await this.removeOfferOwnerIfNeeded(attachment.room, attachment.peerId);
-    }
-  }
-
-  async removeOfferOwnerIfNeeded(roomName, peerId) {
-    const key = `offer:${roomName}`;
-    const savedOffer = await this.ctx.storage.get(key);
-    if (savedOffer?.ownerId === peerId) await this.ctx.storage.delete(key);
-  }
-
-  peersInRoom(roomName) {
-    return this.ctx.getWebSockets().filter((peer) => {
-      const attachment = peer.deserializeAttachment();
-      return attachment?.room === roomName && peer.readyState !== WebSocket.CLOSED;
-    });
+  async webSocketError(_socket, error) {
+    console.error("Signaling WebSocket error", error);
   }
 }
