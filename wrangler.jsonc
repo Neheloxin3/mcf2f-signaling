@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "mcf2f-relay",
+  "name": "mcf2f-srelay",
   "main": "index.js",
   "compatibility_date": "2026-10-21",
   "durable_objects": {
