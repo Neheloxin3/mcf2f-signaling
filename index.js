@@ -4,7 +4,7 @@ const MAX_SDP_LENGTH = 200_000;
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+    if (request.method === "GET" && url.pathname === "/health") {
       return Response.json({ status: "ok", service: "mcf2f-signaling-server" });
     }
 
